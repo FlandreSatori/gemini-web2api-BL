@@ -267,7 +267,8 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
 
     last_err = None
     attempt = 0
-    while attempt < current_config()["retry_attempts"]:
+    retry_attempts = max(1, int(current_config().get("retry_attempts", 1)))
+    while attempt < retry_attempts:
         try:
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
             if proxy:
@@ -288,16 +289,16 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                 continue
             last_err = e
             attempt += 1
-            if attempt < current_config()["retry_attempts"] - 1:
-                log(f"Retry {attempt}/{current_config()['retry_attempts']}: {e}")
+            if attempt < retry_attempts:
+                log(f"Retry {attempt}/{retry_attempts}: {e}")
                 time.sleep(current_config()["retry_delay_sec"])
         except Exception as e:
             last_err = e
             attempt += 1
-            if attempt < current_config()["retry_attempts"] - 1:
-                log(f"Retry {attempt}/{current_config()['retry_attempts']}: {e}")
+            if attempt < retry_attempts:
+                log(f"Retry {attempt}/{retry_attempts}: {e}")
                 time.sleep(current_config()["retry_delay_sec"])
-    raise last_err
+    raise last_err or RuntimeError("Gemini generation failed without an exception")
 
 
 def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
@@ -317,7 +318,8 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
     last_err = None
     emitted_raw_text = ""
     attempt = 0
-    while attempt < current_config()["retry_attempts"]:
+    retry_attempts = max(1, int(current_config().get("retry_attempts", 1)))
+    while attempt < retry_attempts:
         try:
             with client.stream("POST", url, content=body, headers=headers) as resp:
                 resp.raise_for_status()
@@ -349,13 +351,13 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                 continue
             last_err = e
             attempt += 1
-            if attempt < current_config()["retry_attempts"]:
-                log(f"Stream retry {attempt}/{current_config()['retry_attempts']}: {e}")
+            if attempt < retry_attempts:
+                log(f"Stream retry {attempt}/{retry_attempts}: {e}")
                 time.sleep(current_config()["retry_delay_sec"])
         except Exception as e:
             last_err = e
             attempt += 1
-            if attempt < current_config()["retry_attempts"]:
-                log(f"Stream retry {attempt}/{current_config()['retry_attempts']}: {e}")
+            if attempt < retry_attempts:
+                log(f"Stream retry {attempt}/{retry_attempts}: {e}")
                 time.sleep(current_config()["retry_delay_sec"])
-    raise last_err
+    raise last_err or RuntimeError("Gemini streaming failed without an exception")
