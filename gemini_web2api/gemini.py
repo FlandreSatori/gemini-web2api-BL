@@ -195,20 +195,23 @@ def _fetch_latest_bl():
         return None
 
 
-def _refresh_bl_until_ready(failed_bl: str = None) -> None:
-    """Block all LLM traffic until a valid shared BL has been fetched."""
+def _refresh_bl_until_ready(failed_bl: str = None) -> bool:
+    """Fetch a new shared BL and report whether it actually changed."""
     with _bl_update_lock:
         if shared_bl() != failed_bl and failed_bl is not None:
             mark_bl_ready(shared_bl())
-            return
+            return True
         invalidate_bl()
-        while True:
-            latest_bl = _fetch_latest_bl()
-            if latest_bl:
-                log(f"BL auto-updated: {shared_bl()} -> {latest_bl}")
-                mark_bl_ready(latest_bl)
-                return
-            time.sleep(current_config().get("bl_retry_delay_sec", 10))
+        latest_bl = _fetch_latest_bl()
+        current_bl = shared_bl()
+        if latest_bl and latest_bl != current_bl:
+            log(f"BL auto-updated: {current_bl} -> {latest_bl}")
+            mark_bl_ready(latest_bl)
+            return True
+        mark_bl_ready(current_bl)
+        if latest_bl == current_bl:
+            log(f"BL unchanged after 405: {current_bl}")
+        return False
 
 
 def clean_text(text: str, strip: bool = True) -> str:
@@ -284,9 +287,10 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             return extract_response_text(raw)
         except urllib.error.HTTPError as e:
             if e.code == 405:
-                _refresh_bl_until_ready(url.split("bl=", 1)[1].split("&", 1)[0])
-                url = _get_url()
-                continue
+                failed_bl = url.split("bl=", 1)[1].split("&", 1)[0]
+                if _refresh_bl_until_ready(failed_bl):
+                    url = _get_url()
+                    continue
             last_err = e
             attempt += 1
             if attempt < retry_attempts:
@@ -346,9 +350,10 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             return
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 405:
-                _refresh_bl_until_ready(url.split("bl=", 1)[1].split("&", 1)[0])
-                url = _get_url()
-                continue
+                failed_bl = url.split("bl=", 1)[1].split("&", 1)[0]
+                if _refresh_bl_until_ready(failed_bl):
+                    url = _get_url()
+                    continue
             last_err = e
             attempt += 1
             if attempt < retry_attempts:
