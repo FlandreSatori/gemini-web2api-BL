@@ -46,6 +46,7 @@ def main():
         user_config = dict(CONFIG)
         user_config["cookie_file"] = cookie_file
         user_config["port"] = CONFIG["port"] + index
+        user_config["user_id"] = f"user{index + 1}"
         server = ThreadedServer((CONFIG["host"], user_config["port"]), GeminiHandler, user_config)
         servers.append(server)
 

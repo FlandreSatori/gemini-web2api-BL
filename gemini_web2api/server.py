@@ -3,6 +3,7 @@ import json
 import time
 import uuid
 import re
+import traceback
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
@@ -50,7 +51,27 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         client_ip = self.client_address[0] if self.client_address else "-"
-        log(f"{client_ip} {fmt % args}")
+        log(f"[{self._user_label()}] {client_ip} {fmt % args}")
+
+    def _user_label(self):
+        config = current_config()
+        return (f"{config.get('user_id', 'default')} "
+                f"port={config.get('port', '?')} "
+                f"cookie={config.get('cookie_file') or 'none'}")
+
+    def _log_exception(self, message, error):
+        detail = f"{type(error).__name__}: {error!r}"
+        log(f"[{self._user_label()}] {message}: {detail}")
+        log(traceback.format_exc().rstrip())
+
+    def _upstream_error(self, error):
+        self._log_exception("Upstream request failed", error)
+        return {
+            "error": {
+                "message": f"upstream error ({type(error).__name__}): {error}",
+                "user": current_config().get("user_id", "default"),
+            }
+        }
 
     def send_json(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode()
@@ -169,9 +190,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as e:
-            log(f"POST error: {e}")
+            self._log_exception(f"POST error path={self.path}", e)
             try:
-                self.send_json({"error": {"message": str(e)}}, 500)
+                self.send_json({
+                    "error": {
+                        "message": f"internal error ({type(e).__name__}): {e}",
+                        "user": current_config().get("user_id", "default"),
+                    }
+                }, 500)
             except:
                 pass
 
@@ -200,7 +226,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         try:
             file_refs = _upload_images(images)
         except RuntimeError as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            self.send_json(self._upstream_error(e), 502)
             return
 
         if stream and (not tools or tool_choice == "none"):
@@ -232,13 +258,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception as e:
-                log(f"Stream error: {e}")
+                self._log_exception("Stream error", e)
             return
 
         try:
             text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            self.send_json(self._upstream_error(e), 502)
             return
 
         tool_calls = None
@@ -331,7 +357,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             file_refs = _upload_images(images)
             text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            self.send_json(self._upstream_error(e), 502)
             return
 
         tool_calls = None
@@ -514,9 +540,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
         try:
             file_refs = _upload_images(images)
         except RuntimeError as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            self.send_json(self._upstream_error(e), 502)
             return
-        log(f"Google API: model={model_name} stream={stream} tools={has_tools} prompt_len={len(prompt)}")
+        log(f"[{self._user_label()}] Google API: model={model_name} stream={stream} "
+            f"tools={has_tools} prompt_len={len(prompt)}")
 
         if stream and not has_tools:
             try:
@@ -546,13 +573,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception as e:
-                log(f"Google stream error: {e}")
+                self._log_exception("Google stream error", e)
             return
 
         try:
             text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            self.send_json(self._upstream_error(e), 502)
             return
 
         if not text:
