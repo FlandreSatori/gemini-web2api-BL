@@ -98,7 +98,15 @@ def _build_headers() -> dict:
         "Origin": "https://gemini.google.com",
         "Referer": f"https://gemini.google.com{account_prefix}/app",
         "X-Same-Domain": "1",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-CH-UA": '"Google Chrome";v="136", "Chromium";v="136", "Not.A/Brand";v="24"',
+        "Sec-CH-UA-Mobile": "?0",
+        "Sec-CH-UA-Platform": '"Windows"',
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
     }
     if account_prefix:
         headers["X-Goog-AuthUser"] = str(current_config()["auth_user"])
@@ -287,6 +295,12 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             return extract_response_text(raw)
         except urllib.error.HTTPError as e:
             if e.code == 405:
+                try:
+                    detail = e.read(512).decode("utf-8", errors="replace").replace("\n", " ").strip()
+                    if detail:
+                        log(f"Gemini 405 response: {detail[:300]}")
+                except Exception:
+                    pass
                 failed_bl = url.split("bl=", 1)[1].split("&", 1)[0]
                 if _refresh_bl_until_ready(failed_bl):
                     url = _get_url()
@@ -350,6 +364,9 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             return
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 405:
+                detail = e.response.text[:512].replace("\n", " ").strip()
+                if detail:
+                    log(f"Gemini stream 405 response: {detail[:300]}")
                 failed_bl = url.split("bl=", 1)[1].split("&", 1)[0]
                 if _refresh_bl_until_ready(failed_bl):
                     url = _get_url()
