@@ -20,6 +20,13 @@ How it works:
     This is NOT a user-tier spoofing attack - the endpoint simply doesn't
     require auth for anonymous access.
 """
+
+# Keep the historical script path compatible with the modular implementation.
+if __name__ == "__main__":
+    from gemini_web2api.__main__ import main
+    main()
+    raise SystemExit
+
 import json
 import urllib.request
 import urllib.parse

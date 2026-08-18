@@ -16,17 +16,18 @@ try:
 except ImportError:
     HAS_HTTPX = False
 
-from .config import CONFIG
+from .config import (current_config, invalidate_bl, mark_bl_ready,
+                     shared_bl, wait_for_bl)
 
 _ssl_ctx = None
-_cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
+_cookie_cache = {"path": None, "str": "", "sapisid": None, "mtime": 0}
 _httpx_client = None
 _bl_update_lock = threading.Lock()
 _bl_pattern = re.compile(r'boq_assistant-bard-web-server_(\d{8})\.(\d+)_p(\d+)')
 
 
 def log(msg: str):
-    if CONFIG["log_requests"]:
+    if current_config()["log_requests"]:
         import sys
         sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
         sys.stderr.flush()
@@ -42,20 +43,21 @@ def _get_ssl_ctx():
 def _get_httpx_client():
     global _httpx_client
     if _httpx_client is None and HAS_HTTPX:
-        proxy = CONFIG.get("proxy")
+        proxy = current_config().get("proxy")
         transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
-        _httpx_client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True)
+        _httpx_client = httpx.Client(transport=transport, timeout=current_config()["request_timeout_sec"], verify=True)
     return _httpx_client
 
 
 def load_cookie() -> tuple:
     """Load cookie from file with mtime-based caching."""
-    cookie_file = CONFIG.get("cookie_file")
+    cookie_file = current_config().get("cookie_file")
     if not cookie_file or not os.path.exists(cookie_file):
         return "", None
     try:
         mtime = os.path.getmtime(cookie_file)
-        if mtime == _cookie_cache["mtime"] and _cookie_cache["str"]:
+        if (cookie_file == _cookie_cache["path"]
+            and mtime == _cookie_cache["mtime"] and _cookie_cache["str"]):
             return _cookie_cache["str"], _cookie_cache["sapisid"]
         with open(cookie_file, "r") as f:
             content = f.read().strip()
@@ -67,7 +69,8 @@ def load_cookie() -> tuple:
             cookie_str = content
             pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
             sapisid = pairs.get("SAPISID", "")
-        _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})
+        _cookie_cache.update({"path": cookie_file, "str": cookie_str,
+                      "sapisid": sapisid or None, "mtime": mtime})
         return cookie_str, sapisid if sapisid else None
     except Exception as e:
         log(f"Cookie load error: {e}")
@@ -82,7 +85,7 @@ def make_sapisidhash(sapisid: str) -> str:
 
 def _account_prefix() -> str:
     """Return the Gemini account path prefix for non-default Google accounts."""
-    auth_user = CONFIG.get("auth_user")
+    auth_user = current_config().get("auth_user")
     if auth_user is None or auth_user == "":
         return ""
     return f"/u/{auth_user}"
@@ -98,7 +101,7 @@ def _build_headers() -> dict:
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
     if account_prefix:
-        headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
+        headers["X-Goog-AuthUser"] = str(current_config()["auth_user"])
     cookie_str, sapisid = load_cookie()
     if cookie_str:
         headers["Cookie"] = cookie_str
@@ -109,7 +112,7 @@ def _build_headers() -> dict:
 
 def _apply_chat_persistence_flags(inner: list) -> None:
     """Apply Gemini Web persistence flags to an outgoing request payload."""
-    if CONFIG.get("temporary_chats", False):
+    if current_config().get("temporary_chats", False):
         # Match Gemini Web temporary-chat requests.
         inner[41] = [1]
         inner[45] = 1
@@ -145,8 +148,8 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
             inner[k] = v
     outer = [None, json.dumps(inner)]
     params = {"f.req": json.dumps(outer)}
-    if CONFIG.get("xsrf_token"):
-        params["at"] = CONFIG["xsrf_token"]
+    if current_config().get("xsrf_token"):
+        params["at"] = current_config()["xsrf_token"]
     return urllib.parse.urlencode(params)
 
 
@@ -156,7 +159,7 @@ def _get_url() -> str:
     return (
         f"https://gemini.google.com{account_prefix}/_/BardChatUi/data/"
         "assistant.lamda.BardFrontendService/StreamGenerate"
-        f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
+        f"?bl={shared_bl()}&hl=en&_reqid={reqid}&rt=c"
     )
 
 
@@ -172,7 +175,7 @@ def _fetch_latest_bl():
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
         )
         handlers = [_NoRedirect(), urllib.request.HTTPSHandler(context=_get_ssl_ctx())]
-        proxy = CONFIG.get("proxy")
+        proxy = current_config().get("proxy")
         if proxy:
             handlers.insert(0, urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
         opener = urllib.request.build_opener(*handlers)
@@ -180,7 +183,6 @@ def _fetch_latest_bl():
             response = opener.open(req, timeout=15)
         except urllib.error.HTTPError as exc:
             if 300 <= exc.code < 400:
-                log(f"BL fetch redirected to {exc.headers.get('Location', 'unknown')}; keeping current BL")
                 return None
             raise
         matches = _bl_pattern.findall(response.read().decode("utf-8", errors="replace"))
@@ -189,21 +191,24 @@ def _fetch_latest_bl():
         latest = max(matches, key=lambda item: (item[0], int(item[1]), int(item[2])))
         return f"boq_assistant-bard-web-server_{latest[0]}.{latest[1]}_p{latest[2]}"
     except Exception as exc:
-        log(f"BL auto-update fetch failed: {exc}")
+        log(f"BL fetch failed: {exc}")
         return None
 
 
-def _update_bl_if_needed(failed_bl: str = None) -> bool:
+def _refresh_bl_until_ready(failed_bl: str = None) -> None:
+    """Block all LLM traffic until a valid shared BL has been fetched."""
     with _bl_update_lock:
-        current_bl = CONFIG["gemini_bl"]
-        if failed_bl and current_bl != failed_bl:
-            return True
-        latest_bl = _fetch_latest_bl()
-        if latest_bl and latest_bl != current_bl:
-            log(f"BL auto-updated: {current_bl} -> {latest_bl}")
-            CONFIG["gemini_bl"] = latest_bl
-            return True
-        return False
+        if shared_bl() != failed_bl and failed_bl is not None:
+            mark_bl_ready(shared_bl())
+            return
+        invalidate_bl()
+        while True:
+            latest_bl = _fetch_latest_bl()
+            if latest_bl:
+                log(f"BL auto-updated: {shared_bl()} -> {latest_bl}")
+                mark_bl_ready(latest_bl)
+                return
+            time.sleep(current_config().get("bl_retry_delay_sec", 10))
 
 
 def clean_text(text: str, strip: bool = True) -> str:
@@ -253,14 +258,16 @@ def extract_response_text(raw: str) -> str:
 
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     """Non-streaming generation with retry."""
+    wait_for_bl()
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
     url = _get_url()
     headers = _build_headers()
     ctx = _get_ssl_ctx()
-    proxy = CONFIG.get("proxy")
+    proxy = current_config().get("proxy")
 
     last_err = None
-    for attempt in range(CONFIG["retry_attempts"]):
+    attempt = 0
+    while attempt < current_config()["retry_attempts"]:
         try:
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
             if proxy:
@@ -268,25 +275,28 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                     urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
                     urllib.request.HTTPSHandler(context=ctx)
                 )
-                resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
+                resp = opener.open(req, timeout=current_config()["request_timeout_sec"])
             else:
-                resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
+                resp = urllib.request.urlopen(
+                    req, context=ctx, timeout=current_config()["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
             return extract_response_text(raw)
         except urllib.error.HTTPError as e:
-            if e.code == 405 and _update_bl_if_needed(url.split("bl=", 1)[1].split("&", 1)[0]):
+            if e.code == 405:
+                _refresh_bl_until_ready(url.split("bl=", 1)[1].split("&", 1)[0])
                 url = _get_url()
-                log("Retrying with updated BL...")
                 continue
             last_err = e
-            if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
-                time.sleep(CONFIG["retry_delay_sec"])
+            attempt += 1
+            if attempt < current_config()["retry_attempts"] - 1:
+                log(f"Retry {attempt}/{current_config()['retry_attempts']}: {e}")
+                time.sleep(current_config()["retry_delay_sec"])
         except Exception as e:
             last_err = e
-            if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
-                time.sleep(CONFIG["retry_delay_sec"])
+            attempt += 1
+            if attempt < current_config()["retry_attempts"] - 1:
+                log(f"Retry {attempt}/{current_config()['retry_attempts']}: {e}")
+                time.sleep(current_config()["retry_delay_sec"])
     raise last_err
 
 
@@ -298,6 +308,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             yield text
         return
 
+    wait_for_bl()
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
     url = _get_url()
     headers = _build_headers()
@@ -305,7 +316,8 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
 
     last_err = None
     emitted_raw_text = ""
-    for attempt in range(CONFIG["retry_attempts"]):
+    attempt = 0
+    while attempt < current_config()["retry_attempts"]:
         try:
             with client.stream("POST", url, content=body, headers=headers) as resp:
                 resp.raise_for_status()
@@ -331,17 +343,19 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                                 yield delta
             return
         except httpx.HTTPStatusError as e:
-            if e.response.status_code == 405 and _update_bl_if_needed(url.split("bl=", 1)[1].split("&", 1)[0]):
+            if e.response.status_code == 405:
+                _refresh_bl_until_ready(url.split("bl=", 1)[1].split("&", 1)[0])
                 url = _get_url()
-                log("Retrying with updated BL...")
                 continue
             last_err = e
-            if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
-                time.sleep(CONFIG["retry_delay_sec"])
+            attempt += 1
+            if attempt < current_config()["retry_attempts"]:
+                log(f"Stream retry {attempt}/{current_config()['retry_attempts']}: {e}")
+                time.sleep(current_config()["retry_delay_sec"])
         except Exception as e:
             last_err = e
-            if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
-                time.sleep(CONFIG["retry_delay_sec"])
+            attempt += 1
+            if attempt < current_config()["retry_attempts"]:
+                log(f"Stream retry {attempt}/{current_config()['retry_attempts']}: {e}")
+                time.sleep(current_config()["retry_delay_sec"])
     raise last_err

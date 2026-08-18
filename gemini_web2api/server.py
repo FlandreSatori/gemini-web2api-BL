@@ -6,7 +6,7 @@ import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
-from .config import CONFIG
+from .config import CONFIG, bind_config, current_config
 from .models import MODELS, resolve_model
 from .gemini import generate, generate_stream, log
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
@@ -44,6 +44,10 @@ def _upload_images(images: list) -> list:
 
 
 class GeminiHandler(BaseHTTPRequestHandler):
+    def __init__(self, request, client_address, server):
+        self._config_token = bind_config(server.user_config)
+        super().__init__(request, client_address, server)
+
     def log_message(self, fmt, *args):
         client_ip = self.client_address[0] if self.client_address else "-"
         log(f"{client_ip} {fmt % args}")
@@ -97,7 +101,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         return self.rfile.read(length) if length else b""
 
     def _authorized(self):
-        keys = CONFIG.get("api_keys") or []
+        keys = current_config().get("api_keys") or []
         if not keys:
             return True
         # Authorization: Bearer <key>
@@ -179,7 +183,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "invalid JSON"}}, 400)
             return
         model_name, model_id, think_mode, err, extra_fields = resolve_model(
-            req.get("model", CONFIG["default_model"]))
+            req.get("model", current_config()["default_model"]))
         if err:
             self.send_json({"error": {"message": err}}, 400)
             return
@@ -269,7 +273,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "invalid JSON"}}, 400)
             return
         model_name, model_id, think_mode, err, extra_fields = resolve_model(
-            req.get("model", CONFIG["default_model"]))
+            req.get("model", current_config()["default_model"]))
         if err:
             self.send_json({"error": {"message": err}}, 400)
             return
@@ -493,7 +497,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "invalid JSON"}}, 400)
             return
         m = re.match(r'/v1beta/models/([^:?]+)', self.path)
-        model_name = m.group(1) if m else CONFIG["default_model"]
+        model_name = m.group(1) if m else current_config()["default_model"]
         model_name, model_id, think_mode, err, extra_fields = resolve_model(model_name)
         if err:
             self.send_json({"error": {"message": err}}, 400)
@@ -594,3 +598,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 class ThreadedServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+    def __init__(self, server_address, handler_class, user_config=None):
+        self.user_config = user_config or CONFIG
+        super().__init__(server_address, handler_class)

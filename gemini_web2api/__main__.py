@@ -1,8 +1,11 @@
 """Entry point: python -m gemini_web2api"""
 import argparse
+import glob
 import os
+import re
+import threading
 
-from .config import CONFIG, load_config, find_config
+from .config import CONFIG, load_config, find_config, set_shared_bl
 from .models import MODELS
 from .gemini import HAS_HTTPX
 from .server import GeminiHandler, ThreadedServer
@@ -29,22 +32,45 @@ def main():
     if args.proxy:
         CONFIG["proxy"] = args.proxy
 
-    port = CONFIG["port"]
-    server = ThreadedServer((CONFIG["host"], port), GeminiHandler)
+    if args.cookie_file:
+        cookie_files = [args.cookie_file]
+    else:
+        cookie_files = glob.glob("cookie*.txt")
+        cookie_files.sort(key=lambda path: int(re.search(r"cookie(\d*)\.txt$", path).group(1) or 0))
+    if not cookie_files:
+        cookie_files = [CONFIG.get("cookie_file")]
+
+    set_shared_bl(CONFIG["gemini_bl"])
+    servers = []
+    for index, cookie_file in enumerate(cookie_files):
+        user_config = dict(CONFIG)
+        user_config["cookie_file"] = cookie_file
+        user_config["port"] = CONFIG["port"] + index
+        server = ThreadedServer((CONFIG["host"], user_config["port"]), GeminiHandler, user_config)
+        servers.append(server)
+
     print(f"gemini-web2api v{__version__}")
-    print(f"  Listening: http://0.0.0.0:{port}")
-    print(f"  Base URL:  http://localhost:{port}/v1")
+    for index, server in enumerate(servers):
+        config = server.user_config
+        print(f"  User {index + 1}: http://localhost:{config['port']}/v1 "
+              f"(cookie: {config.get('cookie_file') or 'none'})")
+    print(f"  Users:     {len(servers)}")
     print(f"  Models:    {', '.join(MODELS.keys())}")
-    print(f"  Cookie:    {'yes' if CONFIG.get('cookie_file') else 'none (anonymous)'}")
     print(f"  Proxy:     {CONFIG.get('proxy') or 'system env'}")
     print(f"  Streaming: {'httpx (true streaming)' if HAS_HTTPX else 'urllib (buffered)'}")
     print(f"  Temporary: {'yes' if CONFIG.get('temporary_chats', False) else 'no'}")
     print()
     try:
-        server.serve_forever()
+        threads = [threading.Thread(target=server.serve_forever, daemon=True) for server in servers]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
     except KeyboardInterrupt:
         print("\nStopped.")
-        server.shutdown()
+        for server in servers:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":
