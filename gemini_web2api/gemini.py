@@ -8,6 +8,7 @@ import urllib.parse
 import ssl
 import os
 import hashlib
+import threading
 
 try:
     import httpx
@@ -20,6 +21,8 @@ from .config import CONFIG
 _ssl_ctx = None
 _cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
 _httpx_client = None
+_bl_update_lock = threading.Lock()
+_bl_pattern = re.compile(r'boq_assistant-bard-web-server_(\d{8})\.(\d+)_p(\d+)')
 
 
 def log(msg: str):
@@ -157,6 +160,52 @@ def _get_url() -> str:
     )
 
 
+def _fetch_latest_bl():
+    """Fetch the newest Gemini frontend build label without following redirects."""
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, new):
+            return None
+
+    try:
+        req = urllib.request.Request(
+            "https://gemini.google.com/app?hl=en",
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+        )
+        handlers = [_NoRedirect(), urllib.request.HTTPSHandler(context=_get_ssl_ctx())]
+        proxy = CONFIG.get("proxy")
+        if proxy:
+            handlers.insert(0, urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        opener = urllib.request.build_opener(*handlers)
+        try:
+            response = opener.open(req, timeout=15)
+        except urllib.error.HTTPError as exc:
+            if 300 <= exc.code < 400:
+                log(f"BL fetch redirected to {exc.headers.get('Location', 'unknown')}; keeping current BL")
+                return None
+            raise
+        matches = _bl_pattern.findall(response.read().decode("utf-8", errors="replace"))
+        if not matches:
+            return None
+        latest = max(matches, key=lambda item: (item[0], int(item[1]), int(item[2])))
+        return f"boq_assistant-bard-web-server_{latest[0]}.{latest[1]}_p{latest[2]}"
+    except Exception as exc:
+        log(f"BL auto-update fetch failed: {exc}")
+        return None
+
+
+def _update_bl_if_needed(failed_bl: str = None) -> bool:
+    with _bl_update_lock:
+        current_bl = CONFIG["gemini_bl"]
+        if failed_bl and current_bl != failed_bl:
+            return True
+        latest_bl = _fetch_latest_bl()
+        if latest_bl and latest_bl != current_bl:
+            log(f"BL auto-updated: {current_bl} -> {latest_bl}")
+            CONFIG["gemini_bl"] = latest_bl
+            return True
+        return False
+
+
 def clean_text(text: str, strip: bool = True) -> str:
     text = re.sub(
         r'```(?:python|javascript|text)\?code_(?:reference|stdout)&code_event_index=\d+\n.*?```\n?',
@@ -224,6 +273,15 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
             return extract_response_text(raw)
+        except urllib.error.HTTPError as e:
+            if e.code == 405 and _update_bl_if_needed(url.split("bl=", 1)[1].split("&", 1)[0]):
+                url = _get_url()
+                log("Retrying with updated BL...")
+                continue
+            last_err = e
+            if attempt < CONFIG["retry_attempts"] - 1:
+                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+                time.sleep(CONFIG["retry_delay_sec"])
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
@@ -272,6 +330,15 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                             if delta:
                                 yield delta
             return
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 405 and _update_bl_if_needed(url.split("bl=", 1)[1].split("&", 1)[0]):
+                url = _get_url()
+                log("Retrying with updated BL...")
+                continue
+            last_err = e
+            if attempt < CONFIG["retry_attempts"] - 1:
+                log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+                time.sleep(CONFIG["retry_delay_sec"])
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:

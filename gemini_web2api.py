@@ -33,6 +33,7 @@ import hashlib
 import argparse
 import base64
 import binascii
+import threading
 from typing import Optional
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -65,6 +66,8 @@ DEFAULT_CONFIG = {
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
+_BL_UPDATE_LOCK = threading.Lock()
+_BL_PATTERN = re.compile(r'boq_assistant-bard-web-server_(\d{8})\.(\d+)_p(\d+)')
 
 # ─── Models ──────────────────────────────────────────────────────────────────
 # Mapping from JS source: MODE_CATEGORY enum (028-6eb337387583.js)
@@ -162,36 +165,49 @@ def apply_chat_persistence_flags(inner: list) -> None:
 
 def fetch_latest_bl() -> Optional[str]:
     """Fetch the latest gemini_bl from gemini.google.com page."""
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, new):
+            return None
+
     try:
         req = urllib.request.Request(
-            "https://gemini.google.com/app",
+            "https://gemini.google.com/app?hl=en",
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
         ctx = ssl.create_default_context()
+        handlers = [_NoRedirect(), urllib.request.HTTPSHandler(context=ctx)]
         proxy = CONFIG.get("proxy")
         if proxy:
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-                urllib.request.HTTPSHandler(context=ctx))
+            handlers.insert(0, urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        opener = urllib.request.build_opener(*handlers)
+        try:
             resp = opener.open(req, timeout=15)
-        else:
-            resp = urllib.request.urlopen(req, context=ctx, timeout=15)
+        except urllib.error.HTTPError as e:
+            if 300 <= e.code < 400:
+                log(f"BL fetch redirected to {e.headers.get('Location', 'unknown')}; keeping current BL")
+                return None
+            raise
         html = resp.read().decode("utf-8", errors="replace")
-        m = re.search(r'(boq_assistant-bard-web-server_\d+\.\d+_p\d+)', html)
-        if m:
-            return m.group(1)
+        matches = _BL_PATTERN.findall(html)
+        if matches:
+            latest = max(matches, key=lambda item: (item[0], int(item[1]), int(item[2])))
+            return f"boq_assistant-bard-web-server_{latest[0]}.{latest[1]}_p{latest[2]}"
     except Exception as e:
         log(f"BL auto-update fetch failed: {e}")
     return None
 
 
-def update_bl_if_needed() -> bool:
+def update_bl_if_needed(failed_bl: str = None) -> bool:
     """Attempt to fetch and update gemini_bl. Returns True if updated."""
-    new_bl = fetch_latest_bl()
-    if new_bl and new_bl != CONFIG["gemini_bl"]:
-        log(f"BL auto-updated: {CONFIG['gemini_bl']} -> {new_bl}")
-        CONFIG["gemini_bl"] = new_bl
-        return True
-    return False
+    with _BL_UPDATE_LOCK:
+        old_bl = CONFIG["gemini_bl"]
+        if failed_bl and old_bl != failed_bl:
+            return True
+        new_bl = fetch_latest_bl()
+        if new_bl and new_bl != old_bl:
+            log(f"BL auto-updated: {old_bl} -> {new_bl}")
+            CONFIG["gemini_bl"] = new_bl
+            return True
+        return False
 
 
 def upload_images(images: list) -> list:
@@ -289,7 +305,7 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             return resp.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as e:
-            if e.code == 405 and update_bl_if_needed():
+            if e.code == 405 and update_bl_if_needed(url.split("bl=", 1)[1].split("&", 1)[0]):
                 reqid = int(time.time()) % 1000000
                 url = (
                     f"https://gemini.google.com{prefix}/_/BardChatUi/data/"
