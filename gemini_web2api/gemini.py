@@ -9,6 +9,7 @@ import ssl
 import os
 import hashlib
 import threading
+import urllib.error
 
 try:
     import httpx
@@ -23,7 +24,17 @@ _ssl_ctx = None
 _cookie_cache = {"path": None, "str": "", "sapisid": None, "mtime": 0}
 _httpx_client = None
 _bl_update_lock = threading.Lock()
+_rate_limit_lock = threading.Lock()
+_rate_limit_state = {}
 _bl_pattern = re.compile(r'boq_assistant-bard-web-server_(\d{8})\.(\d+)_p(\d+)')
+
+
+class RateLimitError(RuntimeError):
+    """Raised when the local upstream rate-limit circuit is open."""
+
+    def __init__(self, retry_after: int):
+        self.retry_after = retry_after
+        super().__init__(f"upstream rate limit circuit open; retry after {retry_after}s")
 
 
 def log(msg: str):
@@ -31,6 +42,58 @@ def log(msg: str):
         import sys
         sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
         sys.stderr.flush()
+
+
+def _rate_limit_key() -> str:
+    config = current_config()
+    return str(config.get("user_id") or config.get("cookie_file") or "default")
+
+
+def _rate_limit_retry_after() -> int:
+    now = time.monotonic()
+    with _rate_limit_lock:
+        state = _rate_limit_state.get(_rate_limit_key())
+        if not state or state["until"] <= now:
+            return 0
+        return max(1, int(state["until"] - now))
+
+
+def _record_rate_limit(error=None) -> int:
+    config = current_config()
+    base = max(1, int(config.get("rate_limit_cooldown_sec", 60)))
+    maximum = max(base, int(config.get("rate_limit_max_cooldown_sec", 900)))
+    now = time.monotonic()
+    retry_after = None
+    headers = getattr(error, "headers", None)
+    response = getattr(error, "response", None)
+    if headers is None and response is not None:
+        headers = response.headers
+    if headers:
+        try:
+            retry_after = int(float(headers.get("Retry-After", 0)))
+        except (TypeError, ValueError):
+            retry_after = None
+
+    with _rate_limit_lock:
+        previous = _rate_limit_state.get(_rate_limit_key())
+        cooldown = previous["cooldown"] * 2 if previous else base
+        cooldown = min(maximum, max(cooldown, retry_after or 0))
+        _rate_limit_state[_rate_limit_key()] = {"until": now + cooldown, "cooldown": cooldown}
+    return cooldown
+
+
+def _raise_if_rate_limited() -> None:
+    retry_after = _rate_limit_retry_after()
+    if retry_after:
+        raise RateLimitError(retry_after)
+
+
+def _is_rate_limited(error) -> bool:
+    status = getattr(error, "code", None)
+    response = getattr(error, "response", None)
+    if response is not None:
+        status = getattr(response, "status_code", status)
+    return status == 429
 
 
 def _get_ssl_ctx():
@@ -269,6 +332,7 @@ def extract_response_text(raw: str) -> str:
 
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     """Non-streaming generation with retry."""
+    _raise_if_rate_limited()
     wait_for_bl()
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
     url = _get_url()
@@ -294,6 +358,10 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             raw = resp.read().decode("utf-8", errors="replace")
             return extract_response_text(raw)
         except urllib.error.HTTPError as e:
+            if e.code == 429:
+                cooldown = _record_rate_limit(e)
+                log(f"Rate limited (429); circuit open for {cooldown}s")
+                raise RateLimitError(cooldown) from e
             if e.code == 405:
                 try:
                     detail = e.read(512).decode("utf-8", errors="replace").replace("\n", " ").strip()
@@ -327,6 +395,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             yield text
         return
 
+    _raise_if_rate_limited()
     wait_for_bl()
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
     url = _get_url()
@@ -363,6 +432,10 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                                 yield delta
             return
         except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                cooldown = _record_rate_limit(e)
+                log(f"Rate limited (429); circuit open for {cooldown}s")
+                raise RateLimitError(cooldown) from e
             if e.response.status_code == 405:
                 detail = e.response.text[:512].replace("\n", " ").strip()
                 if detail:

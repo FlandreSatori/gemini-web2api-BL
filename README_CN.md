@@ -174,6 +174,19 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
 
 `api_keys` 为空数组 `[]` 时不校验密钥；填入一个或多个密钥后, `/v1/*` 接口需要 `Authorization: Bearer <key>` 或 `x-api-key: <key>`.
 
+当 Gemini 上游返回 `429 Too Many Requests` 时，服务会立即停止当前请求，不再向上游重试，
+并向下游返回 `429`。随后同一账号的请求会在本地熔断窗口内直接返回 `429`，不会发送上游请求。
+熔断窗口结束后才允许一次新的探测请求；如果仍然收到 429，窗口会指数延长，
+并优先遵守上游返回的 `Retry-After`。可通过以下配置调整冷却时间（单位：秒）：
+
+```json
+"rate_limit_cooldown_sec": 60,
+"rate_limit_max_cooldown_sec": 1800
+```
+
+`rate_limit_cooldown_sec` 是首次熔断时间，后续连续触发 429 时翻倍；
+`rate_limit_max_cooldown_sec` 是熔断时间上限。429 不受 `retry_attempts` 控制，不会等待后重试。
+
 ## Docker 部署
 
 ```bash
@@ -187,6 +200,12 @@ docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.js
 ```bash
 cp config.example.json config.json
 docker compose up -d
+```
+
+Docker 后台运行时使用以下命令查看日志：
+
+```bash
+docker logs -f gemini-web2api
 ```
 
 如需挂载 Cookie 文件:
@@ -244,7 +263,7 @@ resp = client.chat.completions.create(
 - **图片上传可能需要 Cookie**: 多模态输入使用 Gemini 网页端图片上传接口。匿名上传失败时, 请配置 Gemini cookie。
 - **Pro/Ultra 非真实路由**: 无付费订阅 cookie 时, `gemini-3.1-pro` 实际路由到 Flash 模型. "Pro" 只是 UI 偏好标签.
 - **单轮对话**: 每次请求是独立对话, 多轮上下文通过在 prompt 中包含历史消息模拟.
-- **频率限制**: Google 可能限制高频请求, server 会自动重试但持续高负载可能被封.
+- **频率限制**: Google 返回 429 后，服务会本地熔断并直接向下游返回 429，避免继续消耗上游请求。
 
 ## 系统要求
 

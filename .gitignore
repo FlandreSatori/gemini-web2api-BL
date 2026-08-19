@@ -1,7 +1,7 @@
 __pycache__/
 *.pyc
 config.json
-cookie.txt
+*.txt
 cookie.json
 .env
 .idea

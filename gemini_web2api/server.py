@@ -9,7 +9,7 @@ from socketserver import ThreadingMixIn
 
 from .config import CONFIG, bind_config, current_config
 from .models import MODELS, resolve_model
-from .gemini import generate, generate_stream, log
+from .gemini import RateLimitError, generate, generate_stream, log
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
@@ -72,6 +72,15 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 "user": current_config().get("user_id", "default"),
             }
         }
+
+    def _rate_limit_response(self, error):
+        self.send_json({
+            "error": {
+                "message": "upstream rate limit; request blocked locally",
+                "type": "rate_limit_error",
+                "retry_after": error.retry_after,
+            }
+        }, 429)
 
     def send_json(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode()
@@ -230,8 +239,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         if stream and (not tools or tool_choice == "none"):
+            response_started = False
             try:
+                stream_result = generate_stream(prompt, model_id, think_mode, file_refs, extra_fields)
+                first_delta = next(stream_result, None)
                 self._start_sse()
+                response_started = True
                 first_chunk = {
                     "id": cid,
                     "object": "chat.completion.chunk",
@@ -245,7 +258,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 }
                 self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
                 self.wfile.flush()
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                if first_delta:
+                    chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                             "model": model_name, "choices": [{"index": 0, "delta": {"content": first_delta}, "finish_reason": None}]}
+                    self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.flush()
+                for delta in stream_result:
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -257,12 +275,20 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            except RateLimitError as e:
+                if response_started:
+                    self._log_exception("Stream rate limit after response started", e)
+                else:
+                    self._rate_limit_response(e)
             except Exception as e:
                 self._log_exception("Stream error", e)
             return
 
         try:
             text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+        except RateLimitError as e:
+            self._rate_limit_response(e)
+            return
         except Exception as e:
             self.send_json(self._upstream_error(e), 502)
             return
@@ -356,6 +382,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
         try:
             file_refs = _upload_images(images)
             text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+        except RateLimitError as e:
+            self._rate_limit_response(e)
+            return
         except Exception as e:
             self.send_json(self._upstream_error(e), 502)
             return
@@ -546,10 +575,22 @@ class GeminiHandler(BaseHTTPRequestHandler):
             f"tools={has_tools} prompt_len={len(prompt)}")
 
         if stream and not has_tools:
+            response_started = False
             try:
+                stream_result = generate_stream(prompt, model_id, think_mode, file_refs, extra_fields)
+                first_delta = next(stream_result, None)
                 self._start_sse()
+                response_started = True
                 full_text = ""
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                if first_delta:
+                    full_text += first_delta
+                    chunk_obj = {
+                        "candidates": [{"content": {"parts": [{"text": first_delta}], "role": "model"}, "index": 0}],
+                        "modelVersion": model_name,
+                    }
+                    self.wfile.write(f"data: {json.dumps(chunk_obj, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.flush()
+                for delta in stream_result:
                     if not delta:
                         continue
                     full_text += delta
@@ -572,12 +613,20 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            except RateLimitError as e:
+                if response_started:
+                    self._log_exception("Google stream rate limit after response started", e)
+                else:
+                    self._rate_limit_response(e)
             except Exception as e:
                 self._log_exception("Google stream error", e)
             return
 
         try:
             text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+        except RateLimitError as e:
+            self._rate_limit_response(e)
+            return
         except Exception as e:
             self.send_json(self._upstream_error(e), 502)
             return
