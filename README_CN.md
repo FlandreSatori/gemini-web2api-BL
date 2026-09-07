@@ -28,7 +28,8 @@ pip install httpx
 python gemini_web2api.py
 ```
 
-服务启动在 `http://localhost:8081/v1`.
+服务只监听一个端口，启动在 `http://localhost:8081/v1`。如果目录中存在多个 `cookie*.txt`，
+服务会在内部按请求轮询这些账号，不再为每个 Cookie 开放独立端口。
 
 ## 客户端配置
 
@@ -117,8 +118,10 @@ SID=你的SID值; HSID=你的HSID值; SSID=你的SSID值; APISID=你的APISID值
 
 或使用 JSON 格式:
 ```json
-{"cookie": "SID=xxx; HSID=xxx; SSID=xxx; APISID=xxx; SAPISID=xxx; __Secure-1PSID=xxx", "sapisid": "你的SAPISID值"}
+{"cookie": "SID=xxx; HSID=xxx; SSID=xxx; APISID=xxx; SAPISID=xxx; __Secure-1PSID=xxx", "xsrf_token": "该账号的SNlM0e值", "auth_user": "1"}
 ```
+
+多账号运行时，推荐每个 `cookie*.txt` 都使用上面的 JSON 格式，把该账号自己的 `xsrf_token` 和 `auth_user` 放进对应文件。文件中的值优先于 `config.json` 顶层同名配置；纯文本 Cookie 文件仍然支持，并会回退使用顶层配置。
 
 **替代方案 (浏览器扩展)**: 使用任意 "Export Cookies" 扩展导出 `gemini.google.com` 的 cookie, 然后转换为上述单行格式.
 
@@ -130,16 +133,24 @@ SID=你的SID值; HSID=你的HSID值; SSID=你的SSID值; APISID=你的APISID值
 https://gemini.google.com/u/1/app/...
 ```
 
-请把 `auth_user` 设置为该序号。登录态的 Gemini Web 请求还可能需要页面里的 XSRF token。该 token 在渲染后的 Gemini 页面源码中名为 `SNlM0e`; 在 `config.json` 中填入 `xsrf_token` 后, 服务会把它作为 `at` 表单字段提交。
+如果使用纯文本 Cookie，请把 `auth_user` 设置为该序号，并在顶层配置填写 `xsrf_token`。更推荐将它们放入对应 Cookie JSON 文件，这样多账号不会共用同一个 token。页面里的 XSRF token 在渲染后的 Gemini 页面源码中名为 `SNlM0e`; 服务会把它作为 `at` 表单字段提交。
 
 示例:
 
 ```json
 {
   "cookie_file": "/app/cookie.txt",
-  "auth_user": "1",
-  "xsrf_token": "AOOh0P...",
   "gemini_bl": "boq_assistant-bard-web-server_YYYYMMDD.xx_p0"
+}
+```
+
+对应的 `/app/cookie.txt`:
+
+```json
+{
+  "cookie": "SID=xxx; SAPISID=xxx; __Secure-1PSID=xxx",
+  "xsrf_token": "AOOh0P...",
+  "auth_user": "1"
 }
 ```
 
@@ -174,18 +185,26 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
 
 `api_keys` 为空数组 `[]` 时不校验密钥；填入一个或多个密钥后, `/v1/*` 接口需要 `Authorization: Bearer <key>` 或 `x-api-key: <key>`.
 
-当 Gemini 上游返回 `429 Too Many Requests` 时，服务会立即停止当前请求，不再向上游重试，
-并向下游返回 `429`。随后同一账号的请求会在本地熔断窗口内直接返回 `429`，不会发送上游请求。
-熔断窗口结束后才允许一次新的探测请求；如果仍然收到 429，窗口会指数延长，
-并优先遵守上游返回的 `Retry-After`。可通过以下配置调整冷却时间（单位：秒）：
+当 Gemini 上游连续返回错误（包括 `429 Too Many Requests`、HTTP 错误、连接错误和响应解析错误）达到 10 次时，
+服务会通过 Clash 控制器切换到延迟不超过 200ms 的节点。切换后如果仍连续失败 10 次，
+同一账号进入本地指数退避窗口，窗口内不会发送上游请求；退避结束后先重新切换节点，再恢复请求。
+可通过以下配置调整 Clash 控制器、延迟上限和退避时间（单位：秒）：
 
 ```json
+"upstream_failure_threshold": 3,
+"clash_controller": "http://127.0.0.1:58660",
+"clash_secret": "your-clash-secret",
+"clash_proxy_group": "GLOBAL",
+"clash_test_url": "https://gemini.google.com/generate_204",
+"clash_max_latency_ms": 200,
+"clash_backoff_base_sec": 60,
+"clash_backoff_max_sec": 1800,
 "rate_limit_cooldown_sec": 60,
 "rate_limit_max_cooldown_sec": 1800
 ```
 
-`rate_limit_cooldown_sec` 是首次熔断时间，后续连续触发 429 时翻倍；
-`rate_limit_max_cooldown_sec` 是熔断时间上限。429 不受 `retry_attempts` 控制，不会等待后重试。
+`clash_backoff_base_sec` 是切换节点后再次连续失败时的首次退避时间，后续退避翻倍；
+`clash_backoff_max_sec` 是退避时间上限。`rate_limit_*` 配置仍保留用于兼容旧配置，新的 Clash 统一错误熔断使用 `clash_backoff_*`。
 
 ## Docker 部署
 

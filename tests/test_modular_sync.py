@@ -1,13 +1,16 @@
 import http.client
 import base64
 import json
+import os
+import tempfile
 import threading
 import unittest
 from unittest import mock
 from urllib.parse import parse_qs
 
 from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
-from gemini_web2api.gemini import _build_payload
+from gemini_web2api.gemini import _build_payload, load_cookie_session
+from gemini_web2api.gemini import _find_clash_proxy_group
 from gemini_web2api.server import GeminiHandler, ThreadedServer
 from gemini_web2api.tools import google_contents_to_prompt, messages_to_prompt
 
@@ -66,6 +69,40 @@ class PayloadPersistenceTests(unittest.TestCase):
 
         self.assertEqual(inner[0][0], "describe")
         self.assertEqual(inner[0][3], [[None, None, "/uploaded/image-ref"]])
+
+    def test_cookie_json_provides_account_xsrf_and_auth_user(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as cookie_file:
+            json.dump({
+                "cookie": "SAPISID=account-sapisid",
+                "xsrf_token": "account-xsrf",
+                "auth_user": "2",
+            }, cookie_file)
+            path = cookie_file.name
+        try:
+            CONFIG["cookie_file"] = path
+            CONFIG["xsrf_token"] = "global-xsrf"
+            CONFIG["auth_user"] = "global-auth-user"
+            self.assertEqual(
+                load_cookie_session(),
+                ("SAPISID=account-sapisid", "account-sapisid", "account-xsrf", "2"),
+            )
+        finally:
+            os.unlink(path)
+
+    def test_clash_proxy_group_handles_wrapped_proxy_response(self):
+        proxy_response = {
+            "proxies": {
+                "🔰 选择节点": {
+                    "type": "Selector",
+                    "all": ["node-a", "node-b"],
+                    "now": "node-a",
+                },
+            },
+        }
+        group_name, group = _find_clash_proxy_group(
+            proxy_response["proxies"], "🔰 选择节点")
+        self.assertEqual(group_name, "🔰 选择节点")
+        self.assertEqual(group["type"], "Selector")
 
 
 class MessageParsingTests(unittest.TestCase):
@@ -330,7 +367,7 @@ class StreamingEndpointTests(unittest.TestCase):
         )
 
         self.assertEqual(status, 502)
-        self.assertIn("image upload failed: upload denied", json.loads(body)["error"]["message"])
+        self.assertEqual(json.loads(body)["error"]["message"], "upstream request failed")
 
     @mock.patch("gemini_web2api.server.generate_stream", return_value=iter(["streamed"]))
     def test_google_stream_generate_content_uses_sse(self, _generate_stream):

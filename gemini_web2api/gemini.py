@@ -21,11 +21,20 @@ from .config import (current_config, invalidate_bl, mark_bl_ready,
                      shared_bl, wait_for_bl)
 
 _ssl_ctx = None
-_cookie_cache = {"path": None, "str": "", "sapisid": None, "mtime": 0}
+_cookie_cache = {
+    "path": None,
+    "str": "",
+    "sapisid": None,
+    "xsrf_token": None,
+    "auth_user": None,
+    "mtime": 0,
+}
 _httpx_client = None
 _bl_update_lock = threading.Lock()
 _rate_limit_lock = threading.Lock()
 _rate_limit_state = {}
+_clash_lock = threading.Lock()
+_upstream_failure_state = {}
 _bl_pattern = re.compile(r'boq_assistant-bard-web-server_(\d{8})\.(\d+)_p(\d+)')
 
 
@@ -88,6 +97,206 @@ def _raise_if_rate_limited() -> None:
         raise RateLimitError(retry_after)
 
 
+def _failure_key() -> str:
+    config = current_config()
+    return str(config.get("user_id") or config.get("cookie_file") or "default")
+
+
+def _failure_state() -> dict:
+    with _clash_lock:
+        return _upstream_failure_state.setdefault(_failure_key(), {
+            "consecutive": 0,
+            "switched": False,
+            "backoff_until": 0.0,
+            "backoff_level": 0,
+            "pending_switch": False,
+        })
+
+
+def _clash_headers() -> dict:
+    secret = current_config().get("clash_secret")
+    return {"Authorization": f"Bearer {secret}"} if secret else {}
+
+
+def _clash_request(method: str, path: str, data=None):
+    controller = current_config().get("clash_controller")
+    if not controller:
+        return None
+    body = json.dumps(data).encode() if data is not None else None
+    headers = {"Accept": "application/json", **_clash_headers()}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(
+        controller.rstrip("/") + path, data=body, headers=headers, method=method)
+    with urllib.request.urlopen(request, timeout=5) as response:
+        raw = response.read()
+    return json.loads(raw) if raw else None
+
+
+def _display_name(value: str) -> str:
+    """Keep non-ASCII names readable in terminals with the wrong code page."""
+    return value.encode("unicode_escape").decode("ascii")
+
+
+def _repair_mojibake(value: str) -> str:
+    """Recover common UTF-8-as-GBK mojibake from Windows config files."""
+    try:
+        repaired = value.encode("gb18030").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return value
+    return repaired if repaired != value else value
+
+
+def _find_clash_proxy_group(proxies: dict, configured_name: str):
+    group = proxies.get(configured_name)
+    if group:
+        return configured_name, group
+
+    repaired_name = _repair_mojibake(configured_name)
+    if repaired_name != configured_name and repaired_name in proxies:
+        log(f"Clash proxy group name repaired: {_display_name(configured_name)} -> "
+            f"{_display_name(repaired_name)}")
+        return repaired_name, proxies[repaired_name]
+
+    selector_groups = [
+        (name, value) for name, value in proxies.items()
+        if isinstance(value, dict)
+        and value.get("type") in ("Selector", "URLTest", "Fallback")
+        and len(value.get("all") or value.get("proxies") or []) > 1
+    ]
+    if selector_groups:
+        selected_name, selected_group = max(
+            selector_groups,
+            key=lambda item: len(item[1].get("all") or item[1].get("proxies") or []),
+        )
+        log(f"Clash proxy group fallback: {_display_name(configured_name)} -> "
+            f"{_display_name(selected_name)}")
+        return selected_name, selected_group
+    return None, None
+
+
+def _select_low_latency_clash_node() -> bool:
+    """Switch Clash to the best available node at or below the latency limit."""
+    config = current_config()
+    if not config.get("clash_controller"):
+        log("Clash switching skipped: clash_controller is not configured")
+        return False
+    max_latency = max(1, int(config.get("clash_max_latency_ms", 200)))
+    test_url = config.get("clash_test_url", "https://gemini.google.com/generate_204")
+    group_name = config.get("clash_proxy_group", "GLOBAL")
+    log(f"Clash switch started: group={_display_name(group_name)}, max_delay={max_latency}ms")
+    try:
+        proxy_response = _clash_request("GET", "/proxies") or {}
+        proxies = proxy_response.get("proxies", proxy_response)
+        if not isinstance(proxies, dict):
+            log("Clash switching skipped: invalid proxy list response")
+            return False
+        group_name, group = _find_clash_proxy_group(proxies, group_name)
+        if not group:
+            log("Clash switching skipped: no selectable proxy group found")
+            return False
+
+        current = group.get("now")
+        candidates = group.get("all") or group.get("proxies") or []
+        candidates = [name for name in candidates if name not in {current, "DIRECT", "REJECT"}]
+        log(f"Clash testing nodes: current={_display_name(current or 'unknown')}, "
+            f"candidates={len(candidates)}")
+        measured = []
+        for name in candidates:
+            encoded_name = urllib.parse.quote(name, safe="")
+            encoded_url = urllib.parse.quote(test_url, safe="")
+            try:
+                result = _clash_request(
+                    "GET",
+                    f"/proxies/{encoded_name}/delay?url={encoded_url}&timeout=5000",
+                ) or {}
+            except Exception:
+                log(f"Clash node test skipped: node={_display_name(name)}")
+                continue
+            delay = result.get("delay")
+            if isinstance(delay, (int, float)) and 0 < delay <= max_latency:
+                measured.append((delay, name))
+        log(f"Clash node test completed: qualified={len(measured)}/{len(candidates)}")
+        if not measured:
+            log(f"Clash switching skipped: no node <= {max_latency}ms")
+            return False
+        measured.sort(key=lambda item: item[0])
+        delay, selected = measured[0]
+        switch_result = _clash_request(
+            "PUT",
+            f"/proxies/{urllib.parse.quote(group_name, safe='')}",
+            {"name": selected},
+        )
+        if switch_result is not None and not isinstance(switch_result, (dict, list)):
+            log("Clash node switch failed: invalid controller response")
+            return False
+        log(f"Clash node switched: group={_display_name(group_name)}, "
+            f"node={_display_name(selected)}, delay={delay}ms")
+        global _httpx_client
+        old_client = _httpx_client
+        _httpx_client = None
+        if old_client is not None:
+            old_client.close()
+        return True
+    except Exception:
+        log("Clash node switch failed: controller request unsuccessful")
+        return False
+
+
+def _raise_if_failure_backoff() -> None:
+    state = _failure_state()
+    now = time.monotonic()
+    if state["backoff_until"] > now:
+        raise RateLimitError(max(1, int(state["backoff_until"] - now)))
+    if state["pending_switch"]:
+        log("Clash backoff ended: selecting a new node before resuming requests")
+        switched = _select_low_latency_clash_node()
+        with _clash_lock:
+            state["pending_switch"] = False
+            state["switched"] = switched
+
+
+def _record_upstream_success() -> None:
+    state = _failure_state()
+    with _clash_lock:
+        state["consecutive"] = 0
+        state["switched"] = False
+        state["backoff_level"] = 0
+
+
+def _record_upstream_failure(error) -> None:
+    state = _failure_state()
+    threshold = max(1, int(current_config().get("upstream_failure_threshold", 3)))
+    with _clash_lock:
+        state["consecutive"] += 1
+        consecutive = state["consecutive"]
+        switched = state["switched"]
+    log(f"Upstream request failed: consecutive={consecutive}/{threshold}")
+    if consecutive < threshold:
+        return
+    if not switched:
+        log("Upstream failure threshold reached: requesting Clash node switch")
+        switched_now = _select_low_latency_clash_node()
+        with _clash_lock:
+            state["consecutive"] = 0
+            state["switched"] = switched_now
+        return
+    with _clash_lock:
+        state["backoff_level"] += 1
+        level = state["backoff_level"]
+        base = max(1, int(current_config().get("clash_backoff_base_sec", 60)))
+        maximum = max(base, int(current_config().get("clash_backoff_max_sec", 1800)))
+        cooldown = min(maximum, base * (2 ** (level - 1)))
+        state["backoff_until"] = time.monotonic() + cooldown
+        state["consecutive"] = 0
+        state["pending_switch"] = True
+    log(f"Upstream failures persisted after Clash switch: backoff={cooldown}s, level={level}")
+
+
+def _failure_backoff_active() -> bool:
+    return _failure_state()["backoff_until"] > time.monotonic()
+
+
 def _is_rate_limited(error) -> bool:
     status = getattr(error, "code", None)
     response = getattr(error, "response", None)
@@ -114,30 +323,57 @@ def _get_httpx_client():
 
 def load_cookie() -> tuple:
     """Load cookie from file with mtime-based caching."""
+    cookie_str, sapisid, _, _ = load_cookie_session()
+    return cookie_str, sapisid
+
+
+def load_cookie_session() -> tuple:
+    """Load per-account cookie metadata as (cookie, sapisid, xsrf, auth_user)."""
     cookie_file = current_config().get("cookie_file")
     if not cookie_file or not os.path.exists(cookie_file):
-        return "", None
+        return "", None, current_config().get("xsrf_token"), current_config().get("auth_user")
     try:
         mtime = os.path.getmtime(cookie_file)
         if (cookie_file == _cookie_cache["path"]
             and mtime == _cookie_cache["mtime"] and _cookie_cache["str"]):
-            return _cookie_cache["str"], _cookie_cache["sapisid"]
+            return (
+                _cookie_cache["str"],
+                _cookie_cache["sapisid"],
+                _cookie_cache["xsrf_token"] or current_config().get("xsrf_token"),
+                _cookie_cache["auth_user"] if _cookie_cache["auth_user"] is not None
+                else current_config().get("auth_user"),
+            )
         with open(cookie_file, "r") as f:
             content = f.read().strip()
+        xsrf_token = None
+        auth_user = None
         if content.startswith("{"):
             data = json.loads(content)
             cookie_str = data.get("cookie", "")
-            sapisid = data.get("sapisid", "")
+            xsrf_token = data.get("xsrf_token")
+            auth_user = data.get("auth_user")
         else:
             cookie_str = content
-            pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
-            sapisid = pairs.get("SAPISID", "")
+        pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
+        sapisid = pairs.get("SAPISID", "")
         _cookie_cache.update({"path": cookie_file, "str": cookie_str,
-                      "sapisid": sapisid or None, "mtime": mtime})
-        return cookie_str, sapisid if sapisid else None
+                      "sapisid": sapisid or None, "xsrf_token": xsrf_token,
+                      "auth_user": auth_user, "mtime": mtime})
+        return (
+            cookie_str,
+            sapisid if sapisid else None,
+            xsrf_token or current_config().get("xsrf_token"),
+            auth_user if auth_user is not None else current_config().get("auth_user"),
+        )
     except Exception as e:
         log(f"Cookie load error: {e}")
-        return _cookie_cache["str"], _cookie_cache["sapisid"]
+        return (
+            _cookie_cache["str"],
+            _cookie_cache["sapisid"],
+            _cookie_cache["xsrf_token"] or current_config().get("xsrf_token"),
+            _cookie_cache["auth_user"] if _cookie_cache["auth_user"] is not None
+            else current_config().get("auth_user"),
+        )
 
 
 def make_sapisidhash(sapisid: str) -> str:
@@ -148,7 +384,7 @@ def make_sapisidhash(sapisid: str) -> str:
 
 def _account_prefix() -> str:
     """Return the Gemini account path prefix for non-default Google accounts."""
-    auth_user = current_config().get("auth_user")
+    _, _, _, auth_user = load_cookie_session()
     if auth_user is None or auth_user == "":
         return ""
     return f"/u/{auth_user}"
@@ -172,8 +408,9 @@ def _build_headers() -> dict:
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
     }
     if account_prefix:
-        headers["X-Goog-AuthUser"] = str(current_config()["auth_user"])
-    cookie_str, sapisid = load_cookie()
+        _, _, _, auth_user = load_cookie_session()
+        headers["X-Goog-AuthUser"] = str(auth_user)
+    cookie_str, sapisid, _, _ = load_cookie_session()
     if cookie_str:
         headers["Cookie"] = cookie_str
     if sapisid:
@@ -219,8 +456,9 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
             inner[k] = v
     outer = [None, json.dumps(inner)]
     params = {"f.req": json.dumps(outer)}
-    if current_config().get("xsrf_token"):
-        params["at"] = current_config()["xsrf_token"]
+    _, _, xsrf_token, _ = load_cookie_session()
+    if xsrf_token:
+        params["at"] = xsrf_token
     return urllib.parse.urlencode(params)
 
 
@@ -333,6 +571,7 @@ def extract_response_text(raw: str) -> str:
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     """Non-streaming generation with retry."""
     _raise_if_rate_limited()
+    _raise_if_failure_backoff()
     wait_for_bl()
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
     url = _get_url()
@@ -356,12 +595,20 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                 resp = urllib.request.urlopen(
                     req, context=ctx, timeout=current_config()["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
-            return extract_response_text(raw)
+            text = extract_response_text(raw)
+            _record_upstream_success()
+            return text
         except urllib.error.HTTPError as e:
             if e.code == 429:
-                cooldown = _record_rate_limit(e)
-                log(f"Rate limited (429); circuit open for {cooldown}s")
-                raise RateLimitError(cooldown) from e
+                _record_upstream_failure(e)
+                if _failure_backoff_active():
+                    raise RateLimitError(
+                        max(1, int(_failure_state()["backoff_until"] - time.monotonic()))) from e
+            else:
+                _record_upstream_failure(e)
+                if _failure_backoff_active():
+                    raise RateLimitError(
+                        max(1, int(_failure_state()["backoff_until"] - time.monotonic()))) from e
             if e.code == 405:
                 try:
                     detail = e.read(512).decode("utf-8", errors="replace").replace("\n", " ").strip()
@@ -380,6 +627,10 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                 time.sleep(current_config()["retry_delay_sec"])
         except Exception as e:
             last_err = e
+            _record_upstream_failure(e)
+            if _failure_backoff_active():
+                raise RateLimitError(
+                    max(1, int(_failure_state()["backoff_until"] - time.monotonic()))) from e
             attempt += 1
             if attempt < retry_attempts:
                 log(f"Retry {attempt}/{retry_attempts}: {e}")
@@ -396,6 +647,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
         return
 
     _raise_if_rate_limited()
+    _raise_if_failure_backoff()
     wait_for_bl()
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
     url = _get_url()
@@ -430,12 +682,19 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                             emitted_raw_text = t
                             if delta:
                                 yield delta
+            _record_upstream_success()
             return
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 429:
-                cooldown = _record_rate_limit(e)
-                log(f"Rate limited (429); circuit open for {cooldown}s")
-                raise RateLimitError(cooldown) from e
+                _record_upstream_failure(e)
+                if _failure_backoff_active():
+                    raise RateLimitError(
+                        max(1, int(_failure_state()["backoff_until"] - time.monotonic()))) from e
+            else:
+                _record_upstream_failure(e)
+                if _failure_backoff_active():
+                    raise RateLimitError(
+                        max(1, int(_failure_state()["backoff_until"] - time.monotonic()))) from e
             if e.response.status_code == 405:
                 detail = e.response.text[:512].replace("\n", " ").strip()
                 if detail:
@@ -451,6 +710,10 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                 time.sleep(current_config()["retry_delay_sec"])
         except Exception as e:
             last_err = e
+            _record_upstream_failure(e)
+            if _failure_backoff_active():
+                raise RateLimitError(
+                    max(1, int(_failure_state()["backoff_until"] - time.monotonic()))) from e
             attempt += 1
             if attempt < retry_attempts:
                 log(f"Stream retry {attempt}/{retry_attempts}: {e}")

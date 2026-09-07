@@ -15,6 +15,14 @@
   ],
   "cookie_file": null,
   "proxy": null,
+  "clash_controller": "http://127.0.0.1:58660",
+  "clash_secret": null,
+  "clash_proxy_group": "GLOBAL",
+  "clash_test_url": "https://gemini.google.com/generate_204",
+  "clash_max_latency_ms": 200,
+  "clash_backoff_base_sec": 60,
+  "clash_backoff_max_sec": 1800,
+  "upstream_failure_threshold": 3,
   "log_requests": true,
   "temporary_chats": false
 }

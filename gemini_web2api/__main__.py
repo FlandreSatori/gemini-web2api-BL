@@ -41,37 +41,32 @@ def main():
         cookie_files = [CONFIG.get("cookie_file")]
 
     set_shared_bl(CONFIG["gemini_bl"])
-    servers = []
+    user_configs = []
     for index, cookie_file in enumerate(cookie_files):
         user_config = dict(CONFIG)
         user_config["cookie_file"] = cookie_file
-        user_config["port"] = CONFIG["port"] + index
+        user_config["port"] = CONFIG["port"]
         user_config["user_id"] = f"user{index + 1}"
-        server = ThreadedServer((CONFIG["host"], user_config["port"]), GeminiHandler, user_config)
-        servers.append(server)
+        user_configs.append(user_config)
+
+    server = ThreadedServer((CONFIG["host"], CONFIG["port"]), GeminiHandler, user_configs)
 
     print(f"gemini-web2api v{__version__}")
-    for index, server in enumerate(servers):
-        config = server.user_config
-        print(f"  User {index + 1}: http://localhost:{config['port']}/v1 "
-              f"(cookie: {config.get('cookie_file') or 'none'})")
-    print(f"  Users:     {len(servers)}")
+    print(f"  Endpoint:  http://localhost:{CONFIG['port']}/v1")
+    print(f"  Users:     {len(user_configs)} (internal round-robin)")
+    for index, config in enumerate(user_configs):
+        print(f"  User {index + 1}: cookie={config.get('cookie_file') or 'none'}")
     print(f"  Models:    {', '.join(MODELS.keys())}")
     print(f"  Proxy:     {CONFIG.get('proxy') or 'system env'}")
     print(f"  Streaming: {'httpx (true streaming)' if HAS_HTTPX else 'urllib (buffered)'}")
     print(f"  Temporary: {'yes' if CONFIG.get('temporary_chats', False) else 'no'}")
     print()
     try:
-        threads = [threading.Thread(target=server.serve_forever, daemon=True) for server in servers]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
+        server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopped.")
-        for server in servers:
-            server.shutdown()
-            server.server_close()
+        server.shutdown()
+        server.server_close()
 
 
 if __name__ == "__main__":

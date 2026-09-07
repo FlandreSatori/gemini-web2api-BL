@@ -3,7 +3,7 @@ import json
 import time
 import uuid
 import re
-import traceback
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
@@ -46,7 +46,7 @@ def _upload_images(images: list) -> list:
 
 class GeminiHandler(BaseHTTPRequestHandler):
     def __init__(self, request, client_address, server):
-        self._config_token = bind_config(server.user_config)
+        self._config_token = bind_config(server.select_user_config())
         super().__init__(request, client_address, server)
 
     def log_message(self, fmt, *args):
@@ -60,15 +60,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 f"cookie={config.get('cookie_file') or 'none'}")
 
     def _log_exception(self, message, error):
-        detail = f"{type(error).__name__}: {error!r}"
-        log(f"[{self._user_label()}] {message}: {detail}")
-        log(traceback.format_exc().rstrip())
+        log(f"[{self._user_label()}] {message}")
 
     def _upstream_error(self, error):
         self._log_exception("Upstream request failed", error)
         return {
             "error": {
-                "message": f"upstream error ({type(error).__name__}): {error}",
+                "message": "upstream request failed",
                 "user": current_config().get("user_id", "default"),
             }
         }
@@ -203,7 +201,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             try:
                 self.send_json({
                     "error": {
-                        "message": f"internal error ({type(e).__name__}): {e}",
+                        "message": "internal server error",
                         "user": current_config().get("user_id", "default"),
                     }
                 }, 500)
@@ -675,6 +673,14 @@ class ThreadedServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, server_address, handler_class, user_config=None):
-        self.user_config = user_config or CONFIG
+    def __init__(self, server_address, handler_class, user_configs=None):
+        self.user_configs = user_configs or [CONFIG]
+        self._user_index = 0
+        self._user_lock = threading.Lock()
         super().__init__(server_address, handler_class)
+
+    def select_user_config(self):
+        with self._user_lock:
+            config = self.user_configs[self._user_index % len(self.user_configs)]
+            self._user_index += 1
+            return config
